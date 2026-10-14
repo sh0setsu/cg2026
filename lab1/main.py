@@ -16,7 +16,6 @@ def rgb_to_cmyk(r, g, b):
     return c, m, y, k
 
 def cmyk_to_rgb(c, m, y, k):
-    """CMYK (0..1) -> RGB (0..1)."""
     r = (1 - c) * (1 - k)
     g = (1 - m) * (1 - k)
     b = (1 - y) * (1 - k)
