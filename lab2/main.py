@@ -34,6 +34,20 @@ def load_rgb(path):
         note = " (уменьшено)"
     return img, note
 
+AUX_SUFFIXES = {"gt": ("__gt", "_gt", "__GT", "_GT"),
+                "ref": ("__ref", "_ref")}
+
+def is_aux(filename):
+    stem = os.path.splitext(filename)[0]
+    return stem.endswith(AUX_SUFFIXES["gt"] + AUX_SUFFIXES["ref"])
+
+def find_aux(base, kind):
+    for suf in AUX_SUFFIXES[kind]:
+        for ext in EXT:
+            p = base + suf + ext
+            if os.path.exists(p):
+                return p
+    return None
 TEST_DIR = os.path.join(app_dir(), "test_images")
 
 def ensure_test_images():
@@ -209,7 +223,7 @@ class App:
     def _fill_list(self):
         ensure_test_images()
         files = sorted(f for f in os.listdir(TEST_DIR)
-                       if f.lower().endswith(EXT) and "__gt" not in f and "__ref" not in f)
+               if f.lower().endswith(EXT) and not is_aux(f))
         self.combo["values"] = files
         if files:
             self.combo.current(0)
@@ -244,16 +258,14 @@ class App:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
             return
-        note = ""
-        if max(img.size) > MAX_SIDE:
-            s = MAX_SIDE / max(img.size)
-            img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
-            note = " (уменьшено)"
         self.rgb = np.array(img)
         self.gray = ip.to_gray(self.rgb)
+
         base = os.path.splitext(path)[0]
-        self.gt = self._aux(base + "__gt.png", "L", img.size)
-        self.ref = self._aux(base + "__ref.png", "RGB", img.size)
+        p_gt, p_ref = find_aux(base, "gt"), find_aux(base, "ref")
+        self.gt = self._aux(p_gt, "L", img.size) if p_gt else None
+        self.ref = self._aux(p_ref, "RGB", img.size) if p_ref else None
+
         extra = ""
         if self.gt is not None:
             extra += "; есть эталон бинаризации"
@@ -330,12 +342,15 @@ class App:
         self.c_orig.show(arr, f"{raw} байт данных, серий: {runs}")
         self.c_dec.show(dec, "Совпадает с оригиналом" if same else "ОШИБКА: не совпадает!")
         self.c_info.config(text=(
-            f"Исходный размер:  {raw:>10} Б\n"
-            f"RLE-файл:         {len(blob):>10} Б (заголовок {rle.HEADER.size} Б)\n"
-            f"Коэффициент K = исходный / сжатый = {k:.3f}   "
+            f"Исходный размер: {raw:>10} Б\n"
+            f"RLE-файл:        {len(blob):>10} Б (заголовок {rle.HEADER.size} Б)\n"
+            f"Коэффициент K = исходный / сжатый = {k:.3f} "
             f"({'экономия' if k >= 1 else 'ПРИРОСТ'} {abs(1 - 1 / k) * 100:.1f} %)\n"
             f"Средняя длина серии: {raw / runs:.2f} байт\n"
-            f"Сжатие {t_enc:.0f} мс, распаковка {t_dec:.0f} мс, "))
+            f"Сжатие {t_enc:.0f} мс, распаковка {t_dec:.0f} мс, "
+            f"распаковка == оригинал: {'ДА' if same else 'НЕТ'}\n"
+            f"Для справки PNG (LZ77 + Хаффман): {png} Б, K = {raw / png:.3f}\n"
+            f"Теоретические границы схемы: лучший K = 32, худший K = 0.5"))
 
     def save_rle(self):
         if self.blob is None:
@@ -429,9 +444,8 @@ class App:
         txt = f"время: {dt:.0f} мс"
         if self.gt is not None:
             p, r, f1, acc = ip.seg_metrics(res, self.gt)
-            txt += f"\nF1 = {f1:.3f}   точность = {p:.3f}   полнота = {r:.3f}   accuracy = {acc:.3f}"
-        else:
-            txt += "\n(эталона нет - сравнивайте визуально)"
+            txt += (f"\nF1 = {f1:.3f}  точность = {p:.3f}  "
+                    f"полнота = {r:.3f}  accuracy = {acc:.3f}")
         return txt
 
     def update_thr(self):
