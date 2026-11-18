@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>ЛР5: 3D-надпись «ХОХЛОВ»</title>
+<style>
+  body{margin:0;font:13px Segoe UI,Arial,sans-serif;background:#14161c;color:#dde}
+  #app{display:flex;height:100vh}
+  #panel{width:300px;min-width:300px;overflow-y:auto;padding:10px;background:#1c1f27;box-sizing:border-box}
+  #main{flex:1;overflow-y:auto;padding:8px}
+  canvas{width:100%;background:#000;border-radius:6px;display:block;cursor:grab}
+  h3{margin:12px 0 4px;font-size:13px;color:#8fb8ff;border-bottom:1px solid #333}
+  .row{display:flex;align-items:center;gap:6px;margin:2px 0}
+  .row label{width:105px}
+  .row input[type=range]{flex:1}
+  .row span{width:42px;text-align:right;font-family:Consolas,monospace}
+  select,button{width:100%;margin:3px 0;padding:4px;background:#2a2e3a;color:#dde;border:1px solid #444;border-radius:4px}
+  button:hover{background:#363b4b;cursor:pointer}
+  .chk{display:block;margin:2px 0}
+  pre{background:#0d0f14;padding:8px;border-radius:6px;overflow-x:auto;margin:6px 0;font:12px/1.35 Consolas,monospace}
+  #final{font-size:15px;color:#9fe29f;border:1px solid #2f5f2f}
+  textarea{width:100%;height:160px;background:#0d0f14;color:#bcd;border:1px solid #333;font:11px Consolas,monospace}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <div id="sliders"></div>
+
+    <h3>Отражение (масштаб −1)</h3>
+    <label class="chk"><input type="checkbox" id="mx"> по X</label>
+    <label class="chk"><input type="checkbox" id="my"> по Y</label>
+    <label class="chk"><input type="checkbox" id="mz"> по Z</label>
+
+    <h3>Вид</h3>
+    <label class="chk"><input type="checkbox" id="wire"> Каркас (рёбра треугольников)</label>
+    <label class="chk"><input type="checkbox" id="ortho"> Ортографическая проекция</label>
+    <label class="chk"><input type="checkbox" id="auto"> Автовращение вокруг Y</label>
+
+    <h3>Текстура</h3>
+    <select id="texsel">
+      <option value="brick">Кирпичная стена</option>
+      <option value="checker">Шахматная доска</option>
+      <option value="grid">Градиент с сеткой</option>
+    </select>
+    <input type="file" id="texfile" accept="image/*" style="width:100%">
+
+    <button id="reset">Сбросить параметры</button>
+    <p style="color:#889">Мышь: перетаскивание – поворот, колесо – расстояние до камеры.</p>
+  </div>
+
+  <div id="main">
+    <canvas id="gl" width="960" height="560"></canvas>
+    <b>Итоговая матрица преобразования M = T · R · S</b>
+    <button id="copy" style="width:auto;padding:2px 10px;float:right">Копировать</button>
+    <pre id="final"></pre>
+    <details open><summary>Составные матрицы, камера и контрольная вершина</summary><pre id="detail"></pre></details>
+    <details><summary>Массив вершин (первые 60 вершин из <span id="vcount"></span>)</summary>
+      <textarea id="vlist" readonly></textarea></details>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ===================================================================
+   1. МАТРИЦЫ 4x4. Хранение по строкам: m[строка][столбец], вектор - столбец, p' = M·p
+   =================================================================== */
+const mul = (a, b) => {
+  const r = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[i][k] * b[k][j]; r[i][j] = s;
+  }
+  return r;
+};
+const mT  = (x, y, z) => [[1,0,0,x],[0,1,0,y],[0,0,1,z],[0,0,0,1]];
+const mS  = (x, y, z) => [[x,0,0,0],[0,y,0,0],[0,0,z,0],[0,0,0,1]];
+const rad = d => d * Math.PI / 180;
+const mRx = a => { const c = Math.cos(rad(a)), s = Math.sin(rad(a));
+  return [[1,0,0,0],[0,c,-s,0],[0,s,c,0],[0,0,0,1]]; };
+const mRy = a => { const c = Math.cos(rad(a)), s = Math.sin(rad(a));
+  return [[c,0,s,0],[0,1,0,0],[-s,0,c,0],[0,0,0,1]]; };
+const mRz = a => { const c = Math.cos(rad(a)), s = Math.sin(rad(a));
+  return [[c,-s,0,0],[s,c,0,0],[0,0,1,0],[0,0,0,1]]; };
+
+function mPersp(fovDeg, aspect, n, f) {
+  const t = 1 / Math.tan(rad(fovDeg) / 2);
+  return [[t/aspect,0,0,0],[0,t,0,0],
+          [0,0,(f+n)/(n-f),2*f*n/(n-f)],[0,0,-1,0]];
+}
+function mOrtho(fovDeg, aspect, dist, n, f) {
+  const h = dist * Math.tan(rad(fovDeg) / 2), w = h * aspect;   // тот же размер кадра на расстоянии dist
+  return [[1/w,0,0,0],[0,1/h,0,0],[0,0,-2/(f-n),-(f+n)/(f-n)],[0,0,0,1]];
+}
+/* WebGL ждёт матрицы по столбцам, поэтому транспонируем при передаче */
+function colMajor(m) {
+  const o = new Float32Array(16);
+  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) o[c*4 + r] = m[r][c];
+  return o;
+}
+/* Нормали преобразуются матрицей (M₃ₓ₃)^-T = кофакторы / det
+   (для масштаба и отражений это важно: M напрямую дал бы неверные нормали) */
+function normalMat(a) {
+  const C = [
+    [a[1][1]*a[2][2]-a[1][2]*a[2][1], -(a[1][0]*a[2][2]-a[1][2]*a[2][0]),  a[1][0]*a[2][1]-a[1][1]*a[2][0]],
+    [-(a[0][1]*a[2][2]-a[0][2]*a[2][1]), a[0][0]*a[2][2]-a[0][2]*a[2][0], -(a[0][0]*a[2][1]-a[0][1]*a[2][0])],
+    [a[0][1]*a[1][2]-a[0][2]*a[1][1], -(a[0][0]*a[1][2]-a[0][2]*a[1][0]),  a[0][0]*a[1][1]-a[0][1]*a[1][0]]];
+  let det = a[0][0]*C[0][0] + a[0][1]*C[0][1] + a[0][2]*C[0][2];
+  if (Math.abs(det) < 1e-9) det = 1;
+  const o = new Float32Array(9);
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) o[c*3 + r] = C[r][c] / det;
+  return o;
+}
+function fmtM(m) {
+  return m.map(row => row.map(v => {
+    v = Math.round(v * 1000) / 1000; if (Object.is(v, -0)) v = 0;
+    return v.toFixed(3).padStart(9);
+  }).join(' ')).join('\n');
+}
+
+/* ===================================================================
+   2. ГЕОМЕТРИЯ: буквы как наборы выпуклых многоугольников (в плоскости XY),
+      затем каждый многоугольник выдавливается в призму вдоль Z.
+   =================================================================== */
+const HEIGHT = 1.5, THICK = 0.27, DEPTH = 0.5, GAP = 0.3;
+
+const rect = (x0, y0, x1, y1) => [[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+/* наклонный штрих: ширина t по горизонтали, центры оснований xb (низ) и xt (верх) */
+const slant = (xb, xt, y0, y1, t) =>
+  [[xb - t/2, y0],[xb + t/2, y0],[xt + t/2, y1],[xt - t/2, y1]];
+
+function letterX() {                       // Х: две диагонали
+  const w = 0.95, t = 0.30;
+  return { w, polys: [slant(t/2, w - t/2, 0, HEIGHT, t), slant(w - t/2, t/2, 0, HEIGHT, t)] };
+}
+function letterO() {                       // О: эллиптическое кольцо из 24 четырёхугольников
+  const w = 1.0, n = 24, cx = w/2, cy = HEIGHT/2;
+  const a = w/2, b = HEIGHT/2, a2 = a - THICK, b2 = b - THICK, polys = [];
+  for (let i = 0; i < n; i++) {
+    const t0 = 2*Math.PI*i/n, t1 = 2*Math.PI*(i+1)/n;
+    polys.push([[cx + a*Math.cos(t0),  cy + b*Math.sin(t0)],
+                [cx + a*Math.cos(t1),  cy + b*Math.sin(t1)],
+                [cx + a2*Math.cos(t1), cy + b2*Math.sin(t1)],
+                [cx + a2*Math.cos(t0), cy + b2*Math.sin(t0)]]);
+  }
+  return { w, polys };
+}
+function letterL() {                       // Л: стойка справа, верхняя перекладина, левая диагональ
+  const w = 1.05, t = THICK, H = HEIGHT, bar0 = 0.30;
+  return { w, polys: [
+    rect(w - t, 0, w, H),
+    rect(bar0, H - t, w, H),
+    slant(0.14, bar0 + 0.14, 0, H, 0.28)] };
+}
+function letterB() {                       // В: стойка, три перекладины, две «чаши»
+  const w = 0.95, t = THICK, H = HEIGHT, xu = 0.85, xl = w;
+  return { w, polys: [
+    rect(0, 0, t, H),
+    rect(0, H - t, xu, H),
+    rect(0, H/2 - t/2, xu, H/2 + t/2),
+    rect(0, 0, xl, t),
+    rect(xu - t, H/2, xu, H),
+    rect(xl - t, 0, xl, H/2)] };
+}
+const WORD = [letterX(), letterO(), letterX(), letterL(), letterO(), letterB()];   // Х О Х Л О В
+const TOTAL = WORD.reduce((s, l) => s + l.w, 0) + GAP * (WORD.length - 1);
+
+const vert = [];                           // ← МАССИВ ВЕРШИН: x y z  nx ny nz  u v
+const V = (x, y, z, nx, ny, nz, u, v) => vert.push(x, y, z, nx, ny, nz, u, v);
+const area = p => { let s = 0;
+  for (let i = 0; i < p.length; i++) { const a = p[i], b = p[(i+1) % p.length]; s += a[0]*b[1] - b[0]*a[1]; }
+  return s / 2; };
+
+function addPrism(p) {
+  if (area(p) < 0) p = p.slice().reverse();            // всегда против часовой стрелки
+  const z1 = DEPTH/2, z0 = -DEPTH/2, n = p.length;
+  const uv = (x, y) => [(x + TOTAL/2) / HEIGHT, (y + HEIGHT/2) / HEIGHT];  // одинаковая плотность текстуры
+  for (let i = 1; i < n - 1; i++) for (const k of [0, i, i+1]) {          // передняя грань (веер)
+    const q = p[k], t = uv(q[0], q[1]); V(q[0], q[1], z1, 0, 0, 1, t[0], t[1]); }
+  for (let i = 1; i < n - 1; i++) for (const k of [0, i+1, i]) {          // задняя грань
+    const q = p[k], t = uv(q[0], q[1]); V(q[0], q[1], z0, 0, 0, -1, t[0], t[1]); }
+  let acc = 0;
+  for (let i = 0; i < n; i++) {                                           // боковые грани
+    const a = p[i], b = p[(i+1) % n], dx = b[0]-a[0], dy = b[1]-a[1], len = Math.hypot(dx, dy);
+    if (len < 1e-9) continue;
+    const nx = dy/len, ny = -dx/len, ua = acc/HEIGHT, ub = (acc+len)/HEIGHT, vf = DEPTH/HEIGHT;
+    acc += len;
+    V(a[0],a[1],z0,nx,ny,0,ua,0);  V(b[0],b[1],z0,nx,ny,0,ub,0);  V(b[0],b[1],z1,nx,ny,0,ub,vf);
+    V(a[0],a[1],z0,nx,ny,0,ua,0);  V(b[0],b[1],z1,nx,ny,0,ub,vf); V(a[0],a[1],z1,nx,ny,0,ua,vf);
+  }
+}
+let prisms = 0, x0 = -TOTAL / 2;
+for (const L of WORD) {
+  for (const poly of L.polys) { addPrism(poly.map(q => [q[0] + x0, q[1] - HEIGHT/2])); prisms++; }
+  x0 += L.w + GAP;
+}
+const VERTS = new Float32Array(vert);
+const VCOUNT = VERTS.length / 8;
+const LINES = new Uint16Array(VCOUNT * 2);                 // рёбра для каркаса: по 3 на треугольник
+for (let t = 0, k = 0; t < VCOUNT; t += 3) {
+  LINES[k++] = t;   LINES[k++] = t+1;
+  LINES[k++] = t+1; LINES[k++] = t+2;
+  LINES[k++] = t+2; LINES[k++] = t;
+}
+
+/* ===================================================================
+   3. ИНТЕРФЕЙС
+   =================================================================== */
+const GROUPS = [
+  ['Перенос', [['tx','X',-6,6,.1,0], ['ty','Y',-6,6,.1,0], ['tz','Z',-6,6,.1,0]]],
+  ['Поворот, °', [['rx','вокруг X',-180,180,1,-15], ['ry','вокруг Y',-180,180,1,25], ['rz','вокруг Z',-180,180,1,0]]],
+  ['Масштаб', [['sx','по X',.1,3,.05,1], ['sy','по Y',.1,3,.05,1], ['sz','по Z',.1,3,.05,1]]],
+  ['Камера', [['dist','расстояние',6,30,.5,13], ['fov','угол обзора, °',20,90,1,45]]],
+  ['Текстура', [['tile','повторение',.5,4,.1,1]]]
+];
+const ui = {}, DEFAULTS = {};
+const slidersBox = document.getElementById('sliders');
+for (const [title, items] of GROUPS) {
+  const h = document.createElement('h3'); h.textContent = title; slidersBox.appendChild(h);
+  for (const [id, label, mn, mx, st, val] of items) {
+    const row = document.createElement('div'); row.className = 'row';
+    row.innerHTML = '<label>' + label + '</label><input type="range" id="' + id +
+      '" min="' + mn + '" max="' + mx + '" step="' + st + '" value="' + val + '"><span></span>';
+    slidersBox.appendChild(row);
+    const inp = row.querySelector('input'), sp = row.querySelector('span');
+    ui[id] = inp; DEFAULTS[id] = val; inp.readout = sp;
+    const upd = () => { sp.textContent = (+inp.value).toFixed(st < 1 ? 2 : 0); };
+    inp.addEventListener('input', upd); upd();
+  }
+}
+const $ = id => document.getElementById(id);
+const g = id => +ui[id].value;
+function setSlider(id, v) { ui[id].value = v; ui[id].dispatchEvent(new Event('input')); }
+
+$('reset').onclick = () => { for (const id in DEFAULTS) setSlider(id, DEFAULTS[id]);
+  ['mx','my','mz','wire','ortho','auto'].forEach(i => $(i).checked = false); };
+
+/* ===================================================================
+   4. WEBGL
+   =================================================================== */
+const canvas = $('gl');
+const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+if (!gl) { document.body.innerHTML = '<h2 style="padding:20px">WebGL не поддерживается этим браузером</h2>'; throw 0; }
+
+const VS = `
+attribute vec3 aPos; attribute vec3 aNormal; attribute vec2 aUV;
+uniform mat4 uMVP; uniform mat3 uNormalMat; uniform float uTile;
+varying vec3 vN; varying vec2 vUV;
+void main(){
+  vN = normalize(uNormalMat * aNormal);
+  vUV = aUV * uTile;
+  gl_Position = uMVP * vec4(aPos, 1.0);
+}`;
+const FS = `
+precision mediump float;
+uniform sampler2D uTex; uniform vec3 uLight; uniform vec3 uColor; uniform float uUseTex;
+varying vec3 vN; varying vec2 vUV;
+void main(){
+  if (uUseTex < 0.5) { gl_FragColor = vec4(uColor, 1.0); return; }
+  float l = max(dot(normalize(vN), uLight), 0.0);
+  float fill = 0.15 * max(dot(normalize(vN), -uLight), 0.0);
+  vec3 c = texture2D(uTex, vUV).rgb * (0.30 + 0.80 * l + fill);
+  gl_FragColor = vec4(c, 1.0);
+}`;
+function shader(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { alert(gl.getShaderInfoLog(s)); throw 0; }
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { alert(gl.getProgramInfoLog(prog)); throw 0; }
+gl.useProgram(prog);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, VERTS, gl.STATIC_DRAW);          // массив вершин → GPU
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, LINES, gl.STATIC_DRAW);
+
+const STRIDE = 8 * 4;
+[['aPos', 3, 0], ['aNormal', 3, 12], ['aUV', 2, 24]].forEach(([name, size, off]) => {
+  const loc = gl.getAttribLocation(prog, name);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, size, gl.FLOAT, false, STRIDE, off);
+});
+const U = n => gl.getUniformLocation(prog, n);
+const uMVP = U('uMVP'), uNM = U('uNormalMat'), uTile = U('uTile'), uLight = U('uLight'),
+      uColor = U('uColor'), uUseTex = U('uUseTex'), uTex = U('uTex');
+
+/*
+----------
+текстуры
+----------
+*/
+const tex = gl.createTexture();
+function uploadTexture(cv) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+function makeCanvas() { const c = document.createElement('canvas'); c.width = c.height = 512; return c; }
+const TEXGEN = {
+  checker() {
+    const c = makeCanvas(), x = c.getContext('2d');
+    for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) {
+      x.fillStyle = (i + j) % 2 ? '#f2c14e' : '#2b4570'; x.fillRect(i*64, j*64, 64, 64); }
+    return c;
+  },
+  brick() {
+    const c = makeCanvas(), x = c.getContext('2d');
+    x.fillStyle = '#d9d0c1'; x.fillRect(0, 0, 512, 512);
+    let seed = 7; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let r = 0; r < 8; r++) {
+      const off = r % 2 ? 64 : 0;
+      for (let k = -1; k < 5; k++) {
+        const sh = 130 + Math.floor(rnd() * 40);
+        x.fillStyle = 'rgb(' + (sh + 30) + ',' + (sh - 70) + ',' + (sh - 85) + ')';
+        x.fillRect(k*128 + off + 4, r*64 + 4, 120, 56);
+      }
+    }
+    return c;
+  },
+  grid() {
+    const c = makeCanvas(), x = c.getContext('2d');
+    const gr = x.createLinearGradient(0, 0, 512, 0);
+    ['#ff4d4d', '#ffd24d', '#4dff88', '#4dc3ff', '#b04dff', '#ff4d4d'].forEach((col, i) => gr.addColorStop(i/5, col));
+    x.fillStyle = gr; x.fillRect(0, 0, 512, 512);
+    const vg = x.createLinearGradient(0, 0, 0, 512);
+    vg.addColorStop(0, 'rgba(255,255,255,0.5)'); vg.addColorStop(1, 'rgba(0,0,0,0.5)');
+    x.fillStyle = vg; x.fillRect(0, 0, 512, 512);
+    x.strokeStyle = 'rgba(255,255,255,0.7)'; x.lineWidth = 3;
+    for (let i = 0; i <= 512; i += 64) {
+      x.beginPath(); x.moveTo(i, 0); x.lineTo(i, 512); x.stroke();
+      x.beginPath(); x.moveTo(0, i); x.lineTo(512, i); x.stroke(); }
+    return c;
+  }
+};
+$('texsel').onchange = () => uploadTexture(TEXGEN[$('texsel').value]());
+$('texfile').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image();
+  img.onload = () => { const c = makeCanvas(); c.getContext('2d').drawImage(img, 0, 0, 512, 512);
+    uploadTexture(c); URL.revokeObjectURL(img.src); };
+  img.src = URL.createObjectURL(f);
+};
+uploadTexture(TEXGEN.brick());
+
+/*
+----------
+мышь
+----------
+*/
+const wrap = a => ((a + 180) % 360 + 360) % 360 - 180;
+let drag = null;
+canvas.addEventListener('mousedown', e => { drag = [e.clientX, e.clientY]; canvas.style.cursor = 'grabbing'; });
+window.addEventListener('mouseup', () => { drag = null; canvas.style.cursor = 'grab'; });
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  setSlider('ry', wrap(g('ry') + (e.clientX - drag[0]) * 0.5));
+  setSlider('rx', wrap(g('rx') + (e.clientY - drag[1]) * 0.5));
+  drag = [e.clientX, e.clientY];
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault(); setSlider('dist', Math.min(30, Math.max(6, g('dist') + (e.deltaY > 0 ? 0.7 : -0.7))));
+}, { passive: false });
+
+/*
+----------
+текстовый список вершин
+----------
+*/
+$('vcount').textContent = VCOUNT + ' (' + (VCOUNT/3) + ' треугольников, ' + prisms + ' призм)';
+{
+  const lines = ['  №      x       y       z   |    nx     ny     nz   |   u      v'];
+  const f = (v, w) => v.toFixed(3).padStart(w);
+  for (let i = 0; i < Math.min(60, VCOUNT); i++) {
+    const o = i * 8, a = VERTS;
+    lines.push(String(i).padStart(3) + ' ' + f(a[o],8) + f(a[o+1],8) + f(a[o+2],8) + ' | ' +
+      f(a[o+3],6) + ' ' + f(a[o+4],6) + ' ' + f(a[o+5],6) + ' | ' + f(a[o+6],6) + ' ' + f(a[o+7],6));
+  }
+  $('vlist').value = lines.join('\n');
+}
+
+/*
+----------
+кадр
+----------
+*/
+let lastText = '';
+function frame() {
+  if ($('auto').checked) setSlider('ry', wrap(g('ry') + 0.6));
+
+  // 1. матрицы преобразования
+  const sx = g('sx') * ($('mx').checked ? -1 : 1);
+  const sy = g('sy') * ($('my').checked ? -1 : 1);
+  const sz = g('sz') * ($('mz').checked ? -1 : 1);
+  const Tm = mT(g('tx'), g('ty'), g('tz'));
+  const Rm = mul(mRz(g('rz')), mul(mRy(g('ry')), mRx(g('rx'))));     // R = Rz·Ry·Rx
+  const Sm = mS(sx, sy, sz);
+  const M  = mul(Tm, mul(Rm, Sm));                                    // M = T·R·S
+  const aspect = canvas.width / canvas.height, dist = g('dist'), fov = g('fov');
+  const Vm = mT(0, 0, -dist);
+  const Pm = $('ortho').checked ? mOrtho(fov, aspect, dist, 0.1, 100) : mPersp(fov, aspect, 0.1, 100);
+  const MVP = mul(Pm, mul(Vm, M));
+
+  // 2. вывод матриц
+  const p = [VERTS[0], VERTS[1], VERTS[2], 1];
+  const q = M.map(row => row[0]*p[0] + row[1]*p[1] + row[2]*p[2] + row[3]*p[3]);
+  const text =
+    'Порядок: M = T · R · S,  R = Rz · Ry · Rx   (вектор-столбец: p\' = M · p)\n\n' +
+    'T (перенос)\n' + fmtM(Tm) + '\n\nR (поворот)\n' + fmtM(Rm) + '\n\nS (масштаб/отражение)\n' + fmtM(Sm) +
+    '\n\nV (камера: сдвиг на −dist по Z)\n' + fmtM(Vm) +
+    '\n\nP (' + ($('ortho').checked ? 'ортографическая' : 'перспективная') + ' проекция)\n' + fmtM(Pm) +
+    '\n\nMVP = P · V · M\n' + fmtM(MVP) +
+    '\n\nКонтроль: вершина №0 (' + p.slice(0,3).map(v => v.toFixed(3)).join('; ') + ') → M·p = (' +
+    q.slice(0,3).map(v => v.toFixed(3)).join('; ') + ')';
+  const fin = fmtM(M);
+  if (fin + text !== lastText) { lastText = fin + text; $('final').textContent = fin; $('detail').textContent = text; }
+
+  // 3. отрисовка
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.08, 0.09, 0.12, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.uniformMatrix4fv(uMVP, false, colMajor(MVP));
+  gl.uniformMatrix3fv(uNM, false, normalMat(M));
+  gl.uniform1f(uTile, g('tile'));
+  const L = [0.5, 0.8, 0.7], ln = Math.hypot(...L);
+  gl.uniform3f(uLight, L[0]/ln, L[1]/ln, L[2]/ln);
+  gl.uniform1i(uTex, 0);
+  if ($('wire').checked) {
+    gl.uniform1f(uUseTex, 0); gl.uniform3f(uColor, 0.6, 0.95, 0.6);
+    gl.drawElements(gl.LINES, LINES.length, gl.UNSIGNED_SHORT, 0);
+  } else {
+    gl.uniform1f(uUseTex, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, VCOUNT);
+  }
+  requestAnimationFrame(frame);
+}
+$('copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('final').textContent);
+frame();
+</script>
+</body>
+</html>
